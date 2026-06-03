@@ -1,93 +1,134 @@
 {
-  "targets": {
-    "929b5c63e2cb5202": {
-      "asset-hub": "wss://paseo-asset-hub-next-rpc.polkadot.io",
-      "bulletin": "https://paseo-bulletin-next-ipfs.polkadot.io/ipfs",
-      "registry": "0xa7ae171c78f06c248a9b2556c793aa1df5c9173a"
-    }
-  },
+  "targets": {},
   "dependencies": {
-    "929b5c63e2cb5202": {
-      "@example/feedback": "latest"
-    }
+    "@example/feedback": "latest"
   },
   "contracts": {
-    "929b5c63e2cb5202": {
-      "@example/feedback": {
-        "version": 0,
-        "address": "0x6fba91Dbb57EE755ca0d2Ae3c3925473aDCBD977",
-        "abi": [
-          {
-            "type": "constructor",
-            "inputs": [],
-            "stateMutability": "nonpayable"
-          },
-          {
-            "type": "function",
-            "name": "postFeedback",
-            "inputs": [
-              {
-                "name": "cid",
-                "type": "string"
-              }
-            ],
-            "outputs": [
-              {
-                "name": "",
-                "type": "uint64"
-              }
-            ],
-            "stateMutability": "view"
-          },
-          {
-            "type": "function",
-            "name": "getFeedbackCount",
-            "inputs": [],
-            "outputs": [
-              {
-                "name": "",
-                "type": "uint64"
-              }
-            ],
-            "stateMutability": "view"
-          },
-          {
-            "type": "function",
-            "name": "getFeedbackCid",
-            "inputs": [
-              {
-                "name": "id",
-                "type": "uint64"
-              }
-            ],
-            "outputs": [
-              {
-                "name": "",
-                "type": "string"
-              }
-            ],
-            "stateMutability": "view"
-          },
-          {
-            "type": "function",
-            "name": "getFeedbackCreator",
-            "inputs": [
-              {
-                "name": "id",
-                "type": "uint64"
-              }
-            ],
-            "outputs": [
-              {
-                "name": "",
-                "type": "bytes20"
-              }
-            ],
-            "stateMutability": "view"
-          }
-        ],
-        "metadataCid": "bafk2bzacebk4uuozdtdtsbviwdi55yesteyj73mrhfu2i42ow6wugtwqermky"
-      }
+    "@example/feedback": {
+      "version": 2,
+      "address": "0x9cc28C63C73Ff5841dD5792C184c4d633Cd3b055",
+      "abi": [
+        {
+          "inputs": [],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "name": "cid",
+              "type": "string"
+            }
+          ],
+          "name": "postFeedback",
+          "outputs": [
+            {
+              "name": "",
+              "type": "uint64"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getFeedbackCount",
+          "outputs": [
+            {
+              "name": "",
+              "type": "uint64"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "name": "id",
+              "type": "uint64"
+            }
+          ],
+          "name": "getFeedbackCid",
+          "outputs": [
+            {
+              "name": "",
+              "type": "string"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "name": "id",
+              "type": "uint64"
+            }
+          ],
+          "name": "getFeedbackCreator",
+          "outputs": [
+            {
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "Panic",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "name": "",
+              "type": "string"
+            }
+          ],
+          "name": "Error",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "FeedbackNotFound",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidCalldata",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "CalldataTooLarge",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NoSelector",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "UnknownSelector",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NonPayableValueReceived",
+          "type": "error"
+        }
+      ],
+      "metadataCid": "bafk2bzaced4czg6psqd47zatizct3j76kpz5z3ylqnu33z72zbxufgfh6rch6"
     }
-  }
+  },
+  "registry": "0xf62c2ece29cd8df2e10040ecfa5a894a5c5d9cb0"
 }
