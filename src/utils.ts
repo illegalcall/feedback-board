@@ -1,47 +1,106 @@
 import { useState, useEffect } from "react";
 import {
     createAccountsProvider,
-    sandboxTransport,
+    createPapiProvider,
     hostApi,
     preimageManager,
+    requestPermission,
+    sandboxTransport,
     type ProductAccount,
 } from "@novasamatech/host-api-wrapper";
 import { enumValue, RequestCredentialsErr } from "@novasamatech/host-api";
-// Local PAPI descriptor generated from the live chain via:
-//   npx polkadot-api add paseo_asset_hub -w wss://paseo-asset-hub-next-rpc.polkadot.io
-// The published @parity/product-sdk-descriptors lags behind the runtime's
-// signed-extension set (missing EthSetOrigin / AsPgas / AsRingAlias /
-// AuthorizeCall as of 2026-06-02), so every signed tx fails with BadProof
-// unless we use a local snapshot. Mirrors t3rminal-v1/lib/contracts/chain.ts.
-import { paseo_asset_hub } from "@polkadot-api/descriptors";
-import { createClient, AccountId, Binary, type PolkadotSigner, type PolkadotClient, type TypedApi } from "polkadot-api";
+import {
+    ContractManager,
+    createContractRuntimeFromClient,
+    ensureContractAccountMapped,
+} from "@parity/product-sdk-contracts";
+import { paseo_asset_hub } from "@parity/product-sdk-descriptors/paseo-asset-hub";
+import { ss58ToH160 } from "@parity/product-sdk-address";
+import { createClient, AccountId, type PolkadotSigner } from "polkadot-api";
 import { getWsProvider } from "@polkadot-api/ws-provider";
 import { blake2b } from "@noble/hashes/blake2.js";
 import { CID } from "multiformats/cid";
 import * as raw from "multiformats/codecs/raw";
 import type { MultihashDigest } from "multiformats/hashes/interface";
-import { ethers } from "ethers";
 
-// Paseo Asset Hub Next (v2) — genesis last refreshed 2026-06-02 (chain reset).
+// Paseo Asset Hub Next (v2) — chain reset 2026-06-02.
+const PASEO_ASSET_HUB_GENESIS =
+    "0xbf0488dbe9daa1de1c08c5f743e26fdc2a4ecd74cf87dd1b4b1eeb99ae4ef19f" as const;
 const PASEO_ASSET_HUB_WS = "wss://paseo-asset-hub-next-rpc.polkadot.io";
 
 // ---------------------------------------------------------------------------
-// Account flow — direct against host-api-wrapper.
+// Permissions + resource allowances.
 //
-// We deliberately use @novasamatech/host-api-wrapper rather than the older
-// @novasamatech/product-sdk: product-sdk is frozen at 0.7.9-4 (May 2026).
-// host-api-wrapper is the actively-maintained successor — only it has a
-// getProductAccountSigner that accepts "createTransaction" and routes via the
-// host's host_create_transaction RPC, which preserves Paseo Next v2's signed
-// extensions (AsPgas, AsRingAlias, EthSetOrigin, AuthorizeCall). The old PJS-
-// adapter path strips them and the chain rejects with BadProof.
+// `requestPermission` covers ChainSubmit / PreimageSubmit / StatementSubmit;
+// `requestResourceAllocation` covers on-chain quotas (SmartContractAllowance,
+// BulletinAllowance, AutoSigning). Paseo Next v2 requires BOTH before any
+// Revive.call or preimage submit.
+// ---------------------------------------------------------------------------
+
+const _grantedPermissions = new Set<string>();
+
+async function ensurePermission(tag: "ChainSubmit" | "PreimageSubmit" | "StatementSubmit") {
+    if (_grantedPermissions.has(tag)) return;
+    try {
+        const result = await requestPermission({ tag, value: undefined });
+        if (result.isOk() && result.value) {
+            _grantedPermissions.add(tag);
+        } else {
+            console.warn(`[Permission] ${tag} denied`);
+        }
+    } catch (err) {
+        console.warn(`[Permission] ${tag} request failed:`, err);
+    }
+}
+
+let _allowancesPromise: Promise<void> | null = null;
+
+export function claimDefaultAllowances(): Promise<void> {
+    if (_allowancesPromise) return _allowancesPromise;
+    _allowancesPromise = doClaim().catch(err => {
+        _allowancesPromise = null;
+        throw err;
+    });
+    return _allowancesPromise;
+}
+
+async function doClaim(): Promise<void> {
+    console.info("[Allowance] requesting BulletinAllowance + SmartContractAllowance(0) + AutoSigning");
+    const result = await hostApi.requestResourceAllocation(
+        enumValue("v1", [
+            enumValue("BulletinAllowance", undefined),
+            enumValue("SmartContractAllowance", 0),
+            enumValue("AutoSigning", undefined),
+        ]),
+    );
+    result.match(
+        (response: any) => {
+            const outcomes = (response?.value as Array<{ tag?: string }>) ?? [];
+            const order = ["BulletinAllowance", "SmartContractAllowance(0)", "AutoSigning"];
+            outcomes.forEach((o, i) => console.info(`[Allowance] ${order[i]}: ${o.tag ?? "unknown"}`));
+        },
+        (err: unknown) => {
+            console.warn("[Allowance] requestResourceAllocation failed:", err);
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Account flow — host-api-wrapper (matches RPS / t3rminal-v1).
+//
+// We deliberately use @novasamatech/host-api-wrapper rather than the frozen
+// @novasamatech/product-sdk. Only host-api-wrapper accepts the
+// `"createTransaction"` signerType, which routes via host_create_transaction
+// and preserves Paseo Next v2's signed extensions (AsPgas, AsRingAlias,
+// EthSetOrigin, AuthorizeCall) — without it every signed tx fails BadProof.
 // ---------------------------------------------------------------------------
 
 const accountsProvider = createAccountsProvider(sandboxTransport);
 const accountIdCodec = AccountId();
 
-// Polkadot Desktop ≥0.7.5 accepts both `.dot` domains and `localhost:PORT`
-// identifiers as-is from window.location.host — matches t3rminal-v1 exactly.
+// Polkadot Desktop ≥0.7.5 accepts the raw `window.location.host` for both
+// `.dot` domains and `localhost:PORT`. Appending `.dot` would make the signer
+// identifier diverge from the host context and the host denies signing.
 function getProductIdentifier(): string | null {
     if (typeof window === "undefined") return null;
     return window.location.host || null;
@@ -87,14 +146,6 @@ export function useAccountState(): AccountState {
     return state;
 }
 
-// Derive H160 from SS58 — matches what Revive.OriginalAccount uses as key.
-// Done locally via keccak256 of the 32-byte AccountId public key (skip first
-// 12 bytes). Keeps us off the @parity/product-sdk-address import path.
-function ss58ToH160(publicKey: Uint8Array): `0x${string}` {
-    const hash = ethers.keccak256(publicKey);
-    return ("0x" + hash.slice(2 + 24)) as `0x${string}`;
-}
-
 export async function connectAccount(): Promise<void> {
     if (_state.status === "connecting") return;
     setState({ status: "connecting", account: null });
@@ -102,10 +153,6 @@ export async function connectAccount(): Promise<void> {
     try {
         const [identifier, derivationIndex] = getAppAccountId();
         const provider = accountsProvider as any;
-        if (typeof provider.getProductAccount !== "function") {
-            setState({ status: "error", account: null, error: "host-api-wrapper getProductAccount missing" });
-            return;
-        }
         const result = await provider.getProductAccount(identifier, derivationIndex);
         if (result.isErr()) {
             if (result.error instanceof RequestCredentialsErr.NotConnected) {
@@ -119,13 +166,9 @@ export async function connectAccount(): Promise<void> {
 
         const { publicKey } = result.value;
         const productAccount: ProductAccount = { dotNsIdentifier: identifier, derivationIndex, publicKey };
-        // "createTransaction" signerType: host receives full extension bytes
-        // (extra + additionalSigned) from PAPI's tx-utils, forwards to phone
-        // wallet which reconstructs the extrinsic from its own runtime metadata
-        // for chain-known extensions (AsPgas, EthSetOrigin, ...) and signs.
         const signer = provider.getProductAccountSigner(productAccount, "createTransaction");
         const ss58 = accountIdCodec.dec(publicKey);
-        const h160Address = ss58ToH160(publicKey);
+        const h160Address = ss58ToH160(ss58 as never) as `0x${string}`;
 
         let displayName: string | null = null;
         try {
@@ -148,8 +191,8 @@ export async function connectAccount(): Promise<void> {
 
         setState({ status: "ready", account });
 
-        // Kick off the resource-allowance modal eagerly so the user only sees
-        // one host UI per session, before they try to post.
+        // Kick off resource allowances eagerly so the user only sees one host
+        // modal per session (BulletinAllowance + SmartContractAllowance).
         void claimDefaultAllowances();
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -163,54 +206,7 @@ export async function signIn(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Resource allowances — required for Paseo Next v2 contracts and Bulletin.
-//
-// `SmartContractAllowance(0)` is what gates Revive.call — without it AsPgas
-// has no PGAS budget and the chain rejects with BadProof.
-// `BulletinAllowance` is required by StatementStore (preimage submits).
-// `AutoSigning` is best-effort; host returns NotAvailable today.
-//
-// Mirrors t3rminal-v1/lib/host/allowances.ts.
-// ---------------------------------------------------------------------------
-
-let _allowancesPromise: Promise<void> | null = null;
-
-export function claimDefaultAllowances(): Promise<void> {
-    if (_allowancesPromise) return _allowancesPromise;
-    _allowancesPromise = doClaim().catch(err => {
-        _allowancesPromise = null;
-        throw err;
-    });
-    return _allowancesPromise;
-}
-
-async function doClaim(): Promise<void> {
-    console.info("[Allowance] requesting BulletinAllowance + SmartContractAllowance(0) + AutoSigning");
-    const result = await hostApi.requestResourceAllocation(
-        enumValue("v1", [
-            enumValue("BulletinAllowance", undefined),
-            enumValue("SmartContractAllowance", 0),
-            enumValue("AutoSigning", undefined),
-        ]),
-    );
-    result.match(
-        (response: any) => {
-            const outcomes = (response?.value as Array<{ tag?: string }>) ?? [];
-            const order = ["BulletinAllowance", "SmartContractAllowance(0)", "AutoSigning"];
-            outcomes.forEach((o, i) => console.info(`[Allowance] ${order[i]}: ${o.tag ?? "unknown"}`));
-        },
-        (err: unknown) => {
-            console.warn("[Allowance] requestResourceAllocation failed:", err);
-        },
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Bulletin upload — host preimage path.
-//
-// Goes through preimageManager.submit (host signs and submits
-// TransactionStorage.store on Paseo Bulletin Next). Chain rejects with
-// "no allowance set for account" unless BulletinAllowance is granted first.
 // ---------------------------------------------------------------------------
 
 const BLAKE2B_256_CODE = 0xb220;
@@ -244,6 +240,7 @@ export function calculateCID(bytes: Uint8Array): string {
 }
 
 export async function uploadToBulletin(_account: AppAccount, bytes: Uint8Array): Promise<string> {
+    await ensurePermission("PreimageSubmit");
     await claimDefaultAllowances();
     const cid = calculateCID(bytes);
     await preimageManager.submit(bytes);
@@ -251,320 +248,201 @@ export async function uploadToBulletin(_account: AppAccount, bytes: Uint8Array):
 }
 
 // ---------------------------------------------------------------------------
-// Chain client (WS-direct, lazy singleton).
+// Contracts (ContractManager.fromLiveClient — RPS pattern).
 //
-// host-api-wrapper's createPapiProvider routes chain JSON-RPC through the
-// deprecated host_jsonrpc_message_* channel. Polkadot Desktop's new
-// chainConnectionManager (≥0.7.5) doesn't wire that through, so PAPI's
-// chainHead follow stalls or serves stale metadata → BadProof. Going direct
-// to WSS is the only path that works today. Signing still goes through the
-// host product-account signer; only chain RPC bypasses the host. Matches
-// t3rminal-v1/lib/host/provider.ts.
+// `fromLiveClient` resolves the deployed contract address from the on-chain
+// CDM registry on each init, instead of trusting the snapshot in cdm.json.
+// A redeploy is picked up without shipping a new cdm.json. The registry call
+// is itself a view query and so requires a mapped origin — we map the user's
+// account first with a plain runtime, then build the full ContractManager.
 // ---------------------------------------------------------------------------
 
-interface PaseoChainAPI {
-    assetHub: TypedApi<typeof paseo_asset_hub>;
-    raw: { assetHub: PolkadotClient };
-}
-
-let _chainApi: PaseoChainAPI | null = null;
-
-async function getChainAPI(): Promise<PaseoChainAPI> {
-    if (_chainApi) return _chainApi;
-    const provider = getWsProvider(PASEO_ASSET_HUB_WS);
-    const client = createClient(provider);
-    _chainApi = {
-        assetHub: client.getTypedApi(paseo_asset_hub),
-        raw: { assetHub: client },
-    };
-    console.log("[Chain] Paseo Asset Hub Next ready (direct WSS)");
-    return _chainApi;
-}
-
-// ---------------------------------------------------------------------------
-// Contract ABI / address loading from cdm.json
-// ---------------------------------------------------------------------------
-
-let _contractAddress: `0x${string}` | null = null;
-let _iface: ethers.Interface | null = null;
+let _contractManager: ContractManager | null = null;
+let _contract: any = null;
+let _polkadotClient: ReturnType<typeof createClient> | null = null;
 let _cdmJson: any = null;
+let _contractInitPromise: Promise<void> | null = null;
 
 export function stageCdmJson(cdmJson: any): void {
     _cdmJson = cdmJson;
-    // cdm 0.8.18 uses a flat contracts map (no target-hash nesting). Older
-    // 0.7.x had `contracts[targetHash][pkg]`; we still fall through to that
-    // shape so the same code works with either.
-    const contracts = cdmJson?.contracts ?? {};
-    const direct = contracts["@example/feedback"];
-    if (direct?.address && direct?.abi) {
-        _contractAddress = direct.address as `0x${string}`;
-        _iface = new ethers.Interface(direct.abi);
-        return;
-    }
-    for (const targetHash of Object.keys(contracts)) {
-        const entry = contracts[targetHash]?.["@example/feedback"];
-        if (entry?.address && entry?.abi) {
-            _contractAddress = entry.address as `0x${string}`;
-            _iface = new ethers.Interface(entry.abi);
-            return;
-        }
-    }
-    console.warn("[CDM] No deployed @example/feedback found in cdm.json");
 }
 
 export async function initContracts(cdmJson: any): Promise<void> {
     stageCdmJson(cdmJson);
 }
 
-// ---------------------------------------------------------------------------
-// Contract reads — ReviveApi.call with Alice as origin.
-//
-// Alice is always mapped; view functions don't depend on caller identity.
-// ---------------------------------------------------------------------------
-
-const READ_ORIGIN = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
-
-async function readContract(functionName: string, args: unknown[]): Promise<ethers.Result> {
-    if (!_iface || !_contractAddress) {
-        throw new Error("Contract ABI/address not loaded — did cdm install run?");
-    }
-    const api = await getChainAPI();
-    const calldata = _iface.encodeFunctionData(functionName, args);
-    const result = await api.assetHub.apis.ReviveApi.call(
-        READ_ORIGIN,
-        _contractAddress,
-        BigInt(0),
-        undefined,
-        undefined,
-        Binary.fromHex(calldata as `0x${string}`),
-    );
-    if (!result.result.success) {
-        throw new Error(`Contract read ${functionName} failed: ${JSON.stringify(result.result.value)}`);
-    }
-    const hex = Binary.toHex(result.result.value.data);
-    return _iface.decodeFunctionResult(functionName, hex);
-}
-
-// ---------------------------------------------------------------------------
-// Revive mapping probe — t3rminal-v1 pattern.
-//
-// ReviveApi.address(ss58) returns the H160 the runtime would derive.
-// Revive.OriginalAccount(h160) returns Some(ss58) iff the binding exists.
-// If unmapped, we submit Revive.map_account() before the first Revive.call.
-// ---------------------------------------------------------------------------
-
-const _mappedAccounts = new Set<string>();
-
-async function isAccountMapped(account: AppAccount): Promise<boolean> {
-    if (_mappedAccounts.has(account.address)) return true;
+// `getBestBlocks` retry wrapper — Polkadot Desktop tears down the chainHead
+// follow when idle; the first request after wake bails with "No active follow".
+async function wakeChainFollow(): Promise<void> {
+    if (!_polkadotClient) return;
     try {
-        const api = await getChainAPI();
-        const unsafeApi = api.raw.assetHub.getUnsafeApi();
-        const reviveApi = (unsafeApi.apis as any).ReviveApi as
-            | { address(ss58: string): Promise<string | null> }
-            | undefined;
-        const h160 = await reviveApi?.address(account.address);
-        if (!h160) return false;
-        const original = await (unsafeApi.query as any).Revive?.OriginalAccount?.getValue(h160);
-        const mapped = original != null;
-        if (mapped) _mappedAccounts.add(account.address);
-        return mapped;
+        await _polkadotClient.getBestBlocks();
     } catch (err) {
-        console.warn("[Revive] mapping probe failed, assume unmapped:", err);
-        return false;
+        console.warn("[CDM] wakeChainFollow failed:", err);
     }
 }
 
-// ---------------------------------------------------------------------------
-// signSubmitAndWatch with dual resolution path + 120s stall watchdog.
-//
-// PAPI sometimes never delivers txBestBlocksState through Polkadot Desktop's
-// host bridge for Paseo Next v2. We resolve on EITHER:
-//   - PAPI's txBestBlocksState.found, OR
-//   - An inclusion oracle (poll contract state) returning true.
-// Mirrors t3rminal-v1/lib/contracts/revive-bulletin-index.ts.
-// ---------------------------------------------------------------------------
+const NO_FOLLOW_RE = /no active follow/i;
 
-function watchTx(
-    tx: any,
-    signer: PolkadotSigner,
-    label: string,
-    inclusionOracle?: () => Promise<boolean>,
-): Promise<`0x${string}`> {
-    const POLL_INTERVAL_MS = 1500;
-    const STALL_TIMEOUT_MS = 120_000;
-    const submitOpts = { mortality: { mortal: true as const, period: 256 } };
-
-    return new Promise<`0x${string}`>((resolve, reject) => {
-        let settled = false;
-        let pollStopped = false;
-        let broadcastedHash: `0x${string}` | undefined;
-        let stallTimer: ReturnType<typeof setTimeout> | undefined;
-
-        const clearStall = () => { if (stallTimer) { clearTimeout(stallTimer); stallTimer = undefined; } };
-        const armStall = () => {
-            clearStall();
-            stallTimer = setTimeout(() => {
-                if (settled) return;
-                settled = true;
-                pollStopped = true;
-                try { sub.unsubscribe(); } catch { /* noop */ }
-                reject(new Error(`[${label}] stalled: no inclusion within ${STALL_TIMEOUT_MS}ms`));
-            }, STALL_TIMEOUT_MS);
-        };
-        const succeed = (hash: `0x${string}`) => {
-            if (settled) return;
-            settled = true;
-            pollStopped = true;
-            clearStall();
-            resolve(hash);
-        };
-
-        const sub = tx.signSubmitAndWatch(signer, submitOpts).subscribe({
-            next(ev: any) {
-                if (ev.type === "signed") console.log(`[${label}] signed`);
-                if (ev.type === "broadcasted") {
-                    broadcastedHash = ev.txHash;
-                    console.log(`[${label}] broadcasted, watchdog armed`);
-                    armStall();
-                    if (inclusionOracle) {
-                        void (async () => {
-                            while (!pollStopped && !settled) {
-                                try {
-                                    if (await inclusionOracle()) {
-                                        console.log(`[${label}] oracle: landed`);
-                                        if (broadcastedHash) succeed(broadcastedHash);
-                                        return;
-                                    }
-                                    armStall();
-                                } catch (err) {
-                                    console.warn(`[${label}] oracle threw:`, err);
-                                }
-                                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-                            }
-                        })();
-                    }
-                }
-                if (ev.type === "txBestBlocksState" && ev.found) {
-                    armStall();
-                    if (ev.ok === false) {
-                        if (settled) return;
-                        settled = true;
-                        pollStopped = true;
-                        clearStall();
-                        try { sub.unsubscribe(); } catch { /* noop */ }
-                        reject(new Error(`[${label}] dispatch error: ${JSON.stringify(ev.dispatchError)}`));
-                        return;
-                    }
-                    console.log(`[${label}] txBestBlocksState.found in ${ev.block?.hash?.slice(0, 12)}`);
-                    succeed((ev.block?.hash ?? broadcastedHash ?? "0x") as `0x${string}`);
-                }
-                if (ev.type === "finalized") {
-                    console.log(`[${label}] finalized`);
-                    if (!settled) succeed((ev.block?.hash ?? broadcastedHash ?? "0x") as `0x${string}`);
-                    try { sub.unsubscribe(); } catch { /* noop */ }
-                }
-            },
-            error(err: unknown) {
-                if (settled) return;
-                settled = true;
-                pollStopped = true;
-                clearStall();
-                console.error(`[${label}] subscription error:`, err);
-                reject(err instanceof Error ? err : new Error(String(err)));
-            },
-        });
+function withFollowRetry<T extends Record<string, any>>(method: T): T {
+    const wrap = <Fn extends (...a: any[]) => Promise<any>>(fn: Fn): Fn =>
+        (async (...args: any[]) => {
+            await wakeChainFollow();
+            try {
+                return await fn(...args);
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                if (!NO_FOLLOW_RE.test(msg)) throw err;
+                console.warn("[CDM] follow lost mid-call, retrying once:", msg);
+                await wakeChainFollow();
+                return await fn(...args);
+            }
+        }) as Fn;
+    return new Proxy(method, {
+        get(target, prop) {
+            const v = target[prop as keyof T];
+            if (typeof v === "function") return wrap(v.bind(target));
+            return v;
+        },
     });
 }
 
-// ---------------------------------------------------------------------------
-// Public mapping + write helpers.
-// ---------------------------------------------------------------------------
+function wrapContract(contract: any): any {
+    return new Proxy(contract, {
+        get(target, prop) {
+            const m = target[prop];
+            if (m && typeof m === "object" && ("query" in m || "tx" in m)) {
+                return withFollowRetry(m);
+            }
+            return m;
+        },
+    });
+}
 
-export async function ensureMapping(account: AppAccount): Promise<void> {
-    if (_mappedAccounts.has(account.address)) return;
-    await claimDefaultAllowances();
-    const mapped = await isAccountMapped(account);
-    if (mapped) return;
+async function ensureContractsReady(): Promise<void> {
+    if (_contractManager || !_cdmJson) return;
+    if (_contractInitPromise) return _contractInitPromise;
+    _contractInitPromise = (async () => {
+        await ensurePermission("ChainSubmit");
+        await claimDefaultAllowances();
 
-    const api = await getChainAPI();
-    const unsafeApi = api.raw.assetHub.getUnsafeApi();
-    const reviveTx = (unsafeApi as any).tx.Revive;
+        // Asset Hub access:
+        //   localhost dev — host refuses to follow unregistered domains, so go
+        //     direct WS.
+        //   deployed .dot — route through host's chainHead follow via
+        //     createPapiProvider with WS fallback.
+        const isDevHost =
+            typeof window !== "undefined" && /^localhost(:\d+)?$/.test(window.location.host);
+        const provider = isDevHost
+            ? getWsProvider(PASEO_ASSET_HUB_WS)
+            : createPapiProvider(PASEO_ASSET_HUB_GENESIS, getWsProvider(PASEO_ASSET_HUB_WS));
+        _polkadotClient = createClient(provider);
 
-    console.log("[Revive] submitting map_account…");
-    try {
-        await watchTx(reviveTx.map_account(), account.signer, "Revive.map_account");
-        _mappedAccounts.add(account.address);
-        console.log("[Revive] mapped");
-    } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (/AccountAlreadyMapped/i.test(msg)) {
-            _mappedAccounts.add(account.address);
-            console.log("[Revive] already mapped (race)");
-            return;
+        await _polkadotClient.getChainSpecData();
+        await _polkadotClient.getBestBlocks();
+
+        if (!_state.account) {
+            throw new Error("[CDM] Contract init reached without a connected account");
         }
-        throw err;
-    }
+
+        // Map account BEFORE fromLiveClient. `fromLiveClient` immediately calls
+        // `registry.getAddress(...)` as a view, and pallet-revive dry-run-fails
+        // that with `Revive::AccountUnmapped` if the query origin isn't mapped.
+        const initRuntime = createContractRuntimeFromClient(_polkadotClient, paseo_asset_hub);
+        await mapAccountWithRuntime(initRuntime, _state.account);
+
+        _contractManager = await ContractManager.fromLiveClient(
+            _cdmJson,
+            _polkadotClient,
+            paseo_asset_hub,
+            {
+                defaultOrigin: _state.account.address as never,
+                defaultSigner: _state.account.signer,
+                registryOrigin: _state.account.address as never,
+                libraries: ["@example/feedback"],
+            },
+        );
+        _contract = wrapContract(_contractManager.getContract("@example/feedback"));
+        console.log("[CDM] contract ready (live registry resolution)");
+    })();
+    return _contractInitPromise;
 }
-
-async function writeContract(
-    functionName: string,
-    args: unknown[],
-    account: AppAccount,
-    inclusionOracle?: () => Promise<boolean>,
-): Promise<`0x${string}`> {
-    if (!_iface || !_contractAddress) {
-        throw new Error("Contract ABI/address not loaded — did cdm install run?");
-    }
-    await claimDefaultAllowances();
-    await ensureMapping(account);
-
-    const api = await getChainAPI();
-    const unsafeApi = api.raw.assetHub.getUnsafeApi();
-    const reviveTx = (unsafeApi as any).tx.Revive;
-    const calldata = _iface.encodeFunctionData(functionName, args);
-
-    const tx = reviveTx.call({
-        dest: _contractAddress,
-        value: BigInt(0),
-        weight_limit: { ref_time: BigInt("50000000000"), proof_size: BigInt("1000000") },
-        storage_deposit_limit: BigInt("10000000000"),
-        data: Binary.fromHex(calldata as `0x${string}`),
-    });
-
-    return watchTx(tx, account.signer, `Revive.call(${functionName})`, inclusionOracle);
-}
-
-// ---------------------------------------------------------------------------
-// Public contract handle — keeps the `fb.methodName.query(...) / .tx(...)`
-// shape used by App.tsx.
-// ---------------------------------------------------------------------------
 
 export function getContract(): any {
     if (!_cdmJson) return null;
     return new Proxy({}, {
         get(_target, prop) {
-            const fnName = String(prop);
-            return {
-                query: async (...args: any[]) => {
-                    const decoded = await readContract(fnName, args);
-                    const value = decoded.length === 1 ? decoded[0] : decoded;
-                    return { success: true, value };
+            return new Proxy({} as any, {
+                get(_t, methodProp) {
+                    if (methodProp !== "query" && methodProp !== "tx") return undefined;
+                    return async (...args: any[]) => {
+                        await ensureContractsReady();
+                        if (!_contract) throw new Error("Contract init failed");
+                        const real = _contract[prop as string];
+                        if (!real) throw new Error(`Unknown method: ${String(prop)}`);
+                        return real[methodProp](...args);
+                    };
                 },
-                tx: async (...args: any[]) => {
-                    const opts = args[args.length - 1] as { signer: PolkadotSigner; origin: string; oracle?: () => Promise<boolean> };
-                    const callArgs = args.slice(0, -1);
-                    const account = _state.account;
-                    if (!account) throw new Error("No account connected");
-                    return writeContract(fnName, callArgs, account, opts.oracle);
-                },
-            };
+            });
         },
     });
 }
 
 // ---------------------------------------------------------------------------
-// Bulletin reads via public IPFS gateways (Promise.any race)
+// Revive account mapping (RPS pattern).
+//
+// pallet-revive on Paseo Next v2 requires every SS58 origin that calls a
+// contract to have a `Revive.map_account()` entry. `ensureContractAccountMapped`
+// is idempotent — the first call costs one signature, subsequent calls
+// short-circuit.
+// ---------------------------------------------------------------------------
+
+const _mappedAccounts = new Set<string>();
+
+async function mapAccountWithRuntime(
+    runtime: Parameters<typeof ensureContractAccountMapped>[0],
+    account: AppAccount,
+): Promise<void> {
+    if (_mappedAccounts.has(account.address)) return;
+    try {
+        const mapped = await ensureContractAccountMapped(
+            runtime,
+            account.address as never,
+            account.signer,
+        );
+        if (mapped === null) {
+            console.log(`[Revive] Account ${account.address} already mapped`);
+        } else {
+            console.log(`[Revive] Account mapped in block #${mapped.block.number}`);
+        }
+        _mappedAccounts.add(account.address);
+    } catch (err) {
+        console.error("[Revive] ensureContractAccountMapped failed:", err);
+        if (err && typeof err === "object" && "cause" in err) {
+            console.error("[Revive] underlying cause:", (err as any).cause);
+        }
+        throw err;
+    }
+}
+
+export async function ensureMapping(account: AppAccount): Promise<void> {
+    if (_mappedAccounts.has(account.address)) return;
+    await ensureContractsReady();
+    if (!_contractManager) throw new Error("Contract manager not ready");
+    await mapAccountWithRuntime(_contractManager.getRuntime(), account);
+}
+
+// Helper for `address`/`bytes20` contract params — accepts both an SS58
+// AppAccount and a raw hex string. The product-sdk encoder accepts a `0x...`
+// hex string for both Solidity `address` and `bytes20`.
+export function asAddress(hexOrAccount: string | AppAccount): `0x${string}` {
+    const hex = typeof hexOrAccount === "string" ? hexOrAccount : hexOrAccount.h160Address;
+    if (!hex.startsWith("0x")) return ("0x" + hex) as `0x${string}`;
+    return hex as `0x${string}`;
+}
+
+// ---------------------------------------------------------------------------
+// Bulletin reads via public IPFS gateways (Promise.any race).
 // ---------------------------------------------------------------------------
 
 const GATEWAYS = [
@@ -600,7 +478,7 @@ export async function fetchJsonFromBulletin<T = unknown>(cid: string): Promise<T
 }
 
 // ---------------------------------------------------------------------------
-// Misc helpers
+// Misc helpers.
 // ---------------------------------------------------------------------------
 
 export const short = (addr: string) => addr.slice(0, 6) + "..." + addr.slice(-4);

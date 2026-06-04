@@ -7,22 +7,23 @@
     "dev": "vite --host --port 3000 --strictPort",
     "build:frontend": "tsc -b && vite build",
     "build:contracts": "cdm build",
-    "deploy": "cdm deploy -n paseo --assethub-url wss://paseo-asset-hub-next-rpc.polkadot.io --bulletin-url wss://paseo-bulletin-next-rpc.polkadot.io",
+    "deploy": "cdm deploy -n paseo --registry-address 0xf62c2ece29cd8df2e10040ecfa5a894a5c5d9cb0 --assethub-url wss://paseo-asset-hub-next-rpc.polkadot.io --bulletin-url wss://paseo-bulletin-next-rpc.polkadot.io",
     "preview": "vite preview"
   },
   "dependencies": {
-    "@noble/hashes": "^2.0.1",
-    "@novasamatech/host-api": "^0.8.3",
-    "@novasamatech/host-api-wrapper": "^0.8.3",
+    "@noble/hashes": "^2.2.0",
+    "@novasamatech/host-api": "^0.8.4",
+    "@novasamatech/host-api-wrapper": "^0.8.4",
     "@parity/product-sdk": "^0.9.0",
-    "@parity/product-sdk-descriptors": "^0.5.1",
-    "@polkadot-api/descriptors": "file:.papi/descriptors",
+    "@parity/product-sdk-address": "^0.1.1",
+    "@parity/product-sdk-contracts": "^0.7.0",
+    "@parity/product-sdk-descriptors": "^0.5.2",
+    "@parity/product-sdk-tx": "^0.2.7",
     "@polkadot-api/ws-provider": "^0.9.0",
-    "ethers": "^6.16.0",
     "multiformats": "^13.4.2",
     "polkadot-api": "^2.1.3",
-    "react": "19.2.0",
-    "react-dom": "19.2.0"
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",
