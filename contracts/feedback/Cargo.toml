@@ -17,7 +17,7 @@ path = "lib.rs"
 abi-gen = ["pvm-contract-sdk/abi-gen"]
 
 [package.metadata.cdm]
-package = "@example/feedback"
+package = "@illegalcall/feedback"
 
 [dependencies]
 pvm-contract-sdk = { workspace = true }

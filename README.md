@@ -28,6 +28,9 @@ npm run dev
 
 Open the app in Polkadot Desktop or Polkadot Mobile. Localhost dev mode uses a direct WS provider to Paseo Asset Hub Next.
 
+> Deploying **your own copy** (own contract, own `.dot` name, published to the
+> playground)? Follow the step-by-step [DEPLOYMENT.md](./DEPLOYMENT.md).
+
 ### Deploy contract (first time only)
 
 ```bash

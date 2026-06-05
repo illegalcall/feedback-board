@@ -359,10 +359,10 @@ async function ensureContractsReady(): Promise<void> {
                 defaultOrigin: _state.account.address as never,
                 defaultSigner: _state.account.signer,
                 registryOrigin: _state.account.address as never,
-                libraries: ["@example/feedback"],
+                libraries: ["@illegalcall/feedback"],
             },
         );
-        _contract = wrapContract(_contractManager.getContract("@example/feedback"));
+        _contract = wrapContract(_contractManager.getContract("@illegalcall/feedback"));
         console.log("[CDM] contract ready (live registry resolution)");
     })();
     return _contractInitPromise;

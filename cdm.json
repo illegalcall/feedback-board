@@ -1,12 +1,12 @@
 {
   "targets": {},
   "dependencies": {
-    "@example/feedback": "latest"
+    "@illegalcall/feedback": "latest"
   },
   "contracts": {
-    "@example/feedback": {
-      "version": 2,
-      "address": "0x9cc28C63C73Ff5841dD5792C184c4d633Cd3b055",
+    "@illegalcall/feedback": {
+      "version": 1,
+      "address": "0xFa380AF5d2a8a38abeD730447410163BfA8A3Ea4",
       "abi": [
         {
           "inputs": [],
@@ -127,7 +127,7 @@
           "type": "error"
         }
       ],
-      "metadataCid": "bafk2bzaced4czg6psqd47zatizct3j76kpz5z3ylqnu33z72zbxufgfh6rch6"
+      "metadataCid": "bafk2bzacebllni27jesb6yd6cav46fvgwcgdnr4dtbzi2vdikqmq2n5nfzf2i"
     }
   },
   "registry": "0xf62c2ece29cd8df2e10040ecfa5a894a5c5d9cb0"
